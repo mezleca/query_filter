@@ -1,12 +1,13 @@
+#include <bitset>
 #include <charconv>
 #include <functional>
 #include <iostream>
 #include <map>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_map>
 
 template <typename T>
 T str_to(std::string_view sv) {
@@ -60,10 +61,29 @@ static T convert(std::string_view value) {
     QUERY_FIELDS_NV
 
 enum QUERY_OP : int {
+	INVALID = -1,
 #define X(op, str) op,
     QUERY_OP_LIST
 #undef X
 };
+
+enum PARSE_STATE : int {
+	KEY,
+	VALUE
+};
+
+/*
+ "abc a a>5 a>=5"
+  ^^^^^^^^^
+  IKKCKKKOVK
+  		 .
+     	 .
+  		 -> changed state due to char being a op duh ->
+  	 .	        check if temp buffer is valid "a" if so -> proceed
+     .
+     .
+     encounter a space then dump the temp buffer into the normalized query
+ */
 
 struct my_struct {
 	int k;
@@ -73,39 +93,20 @@ struct my_struct {
 };
 
 using token_comp = std::function<bool(my_struct&, std::string_view)>;
+std::unordered_map<std::string_view, std::map<QUERY_OP, token_comp>> token_parser;
 
-std::map<std::string_view, std::map<QUERY_OP, token_comp>> token_parser;
-std::unordered_map<std::string_view, QUERY_OP> op_list = {
-#define X(op, str) { str, QUERY_OP::op },
-        QUERY_OP_LIST
-#undef X
-};
+static constexpr std::bitset<256> make_op_start_table() {
+    std::bitset<256> table{};
 
-// https://stackoverflow.com/questions/48012539/idiomatically-split-a-string-view
-std::vector<std::string_view> split(const std::string_view str, const char delim = ' ')
-{
-    std::vector<std::string_view> result;
+    table.set('>');
+    table.set('<');
+    table.set('=');
+    table.set('!');
 
-    int indexCommaToLeftOfColumn = 0;
-    int indexCommaToRightOfColumn = -1;
-
-    for (int i=0; i < static_cast<int>(str.size()); i++)
-    {
-        if (str[i] == delim)
-        {
-            indexCommaToLeftOfColumn = indexCommaToRightOfColumn;
-            indexCommaToRightOfColumn = i;
-            int index = indexCommaToLeftOfColumn + 1;
-            int length = indexCommaToRightOfColumn - index;
-            std::string_view column(str.data() + index, length);
-            result.push_back(column);
-        }
-    }
-
-    const std::string_view finalColumn(str.data() + indexCommaToRightOfColumn + 1, str.size() - indexCommaToRightOfColumn - 1);
-    result.push_back(finalColumn);
-    return result;
+    return table;
 }
+
+static auto OP_START_TABLE = make_op_start_table();
 
 struct QueryToken {
 	std::string_view key;
@@ -113,41 +114,53 @@ struct QueryToken {
 	QUERY_OP op;
 };
 
-static std::optional<QueryToken> parse_token(std::string_view s) {
-    // find where the operator starts
-    size_t op_start = 0;
-    while (op_start < s.size() && (std::isalnum(s[op_start]) || s[op_start] == '_')) {
-        ++op_start;
-    }
+std::pair<QUERY_OP, size_t> parse_op(std::string_view sv, size_t pos) {
+	char c1 = sv[pos];
+	char c2 = sv[pos + 1];
 
-    if (op_start == 0 || op_start >= s.size()) {
-        return std::nullopt;
-    }
+	switch (c1) {
+		case '>': {
+            if (c2 == '=') {
+                return { QUERY_OP::GTE, 2 };
+            }
 
-    // find where the operator ends
-    size_t op_end = op_start;
-    while (op_end < s.size() && !std::isalnum(s[op_end]) && s[op_end] != '_') {
-        ++op_end;
-    }
+            return { QUERY_OP::GT, 1 };
+        }
 
-    if (op_end == s.size()) {
-        return std::nullopt;
-    }
+        case '<': {
+            if (c2 == '=') {
+                return { QUERY_OP::LTE, 2 };
+            }
 
-    auto op = op_list.find(s.substr(op_start, op_end - op_start));
+            return { QUERY_OP::LT, 1 };
+        }
 
-    if (op == op_list.end()) {
-    	return std::nullopt;
-    }
+        case '=': {
+            if (c2 == '=') { // variation
+                return { QUERY_OP::EQ, 2 };
+            }
 
-    return QueryToken{
-        .key   = s.substr(0, op_start),
-        .value = s.substr(op_end),
-        .op    = op->second
-    };
+            return { QUERY_OP::EQ, 1 };
+        }
+
+        case '!': {
+        	if (c2 == '=') {
+         		return { QUERY_OP::NEQ, 2 };
+         	}
+
+         	std::cout << "invalid op: " << c1 << "\n";
+
+            return { QUERY_OP::INVALID, 1 };
+        }
+	}
+
+	std::cout << "invalid op: " << c1 << "\n";
+
+	return { QUERY_OP::INVALID, 0 };
 }
 
 int main() {
+	std::cout << "\n\n\n";
 	my_struct a { .abc = "bca", .cba = "abc", .num = 222 };
 
 	// create dispatch table for variable shit
@@ -174,49 +187,105 @@ int main() {
 	QUERY_FIELDS_NV
 	#undef X
 
-	std::string_view content = "hello abc!=5 _cba_=abc    abc=bca num!=5.0 num=222 where's the pairs??? snd=444 | valid key with invalid op: abc:=10";
+	std::string_view content = "hello abc=5 _cba_=abc    abc==bca num!=5.0 num!=222 where's the pairs??? snd=444 | valid key with invalid op: abc:=10";
+
+	PARSE_STATE p_state = PARSE_STATE::KEY;
 
 	// split content by spaces
-	auto c_tokens = split(content);
-	std::vector<QueryToken> tokens;
 	std::string nm_content;
 
-	for (const auto& token : c_tokens) {
-		if (token == " ") {
-			nm_content += token;
-			continue;
-		}
+	// state
+	bool hit = false;
 
-		// attempt to parse the token
-		auto parsed = parse_token(token);
+	size_t key_start = 0;
+	size_t op_start = 0, op_end = 0;
+	size_t value_end = 0;
 
-		// if we cant parse treat as text
-		if (!parsed.has_value()) {
-			nm_content += std::string(token) + " ";
-			continue;
-		}
+	auto reset_fn = [&]() {
+		p_state = PARSE_STATE::KEY;
 
-		// uuh
-		tokens.emplace_back(parsed.value());
-	}
+		key_start = 0;
+		op_start = 0;
+		op_end = 0;
+		value_end = 0;
+	};
 
-	bool query_result = true;
+	QUERY_OP cur_op = QUERY_OP::INVALID;
+	QueryToken cur_token = {};
 
-	for (const auto& token : tokens) {
-		auto comp = token_parser[token.key][token.op];
-
-		if (comp == nullptr) {
-			std::cout << "ignoring invalid token " << token.key << "\n";
-			continue;
-		}
-
-		if (!comp(a, token.value)) {
-			query_result = false;
+	// evaluate tokens and normalize content
+	for (size_t i = 0; i < content.length(); i++) {
+		if (hit) {
 			break;
 		}
+
+		bool is_last = content.length() - 1 == i;
+		char c = content[i];
+
+		std::cout << c << "\n";
+
+		switch (p_state) {
+			case PARSE_STATE::KEY: {
+				if (c == ' ' && !is_last) {
+					key_start = i + 1;
+				}
+
+				// is a operator?
+				if (key_start < i && OP_START_TABLE[static_cast<unsigned char>(c)]) {
+					auto [op, size] = parse_op(content, i);
+					cur_op = op;
+
+					// invalidate duplicated op's
+					if (!is_last && c != '=' && content[i + 1] == c) {
+						nm_content += content.substr(key_start, i - 1);
+					} else {
+						p_state = PARSE_STATE::VALUE;
+						op_start = i;
+						op_end = op_start + size;
+					}
+
+					continue;
+				}
+
+				if (key_start == 0) {
+					key_start = i;
+				}
+			} break;
+			case PARSE_STATE::VALUE: {
+				if (c == ' ' || is_last) {
+					cur_token = {
+						.key = content.substr(key_start, op_start - key_start),
+						.value = content.substr(op_end, value_end - op_end + 1),
+						.op = cur_op,
+					};
+
+					auto eval = token_parser[cur_token.key][cur_token.op];
+
+					if (eval == nullptr) {
+						reset_fn();
+						continue;
+					}
+
+					// early exit if the eval hits false (no need to continue)
+					if (!eval(a, cur_token.value)) {
+						hit = true;
+						break;
+					}
+
+					reset_fn();
+					break;
+				}
+
+				value_end = i;
+			} break;
+			default: break;
+		}
 	}
 
-	std::string bleh = query_result ? "true" : "false";
-	std::cout << "query result for:\n" << content << " -> " << bleh << "\n";
+	if (hit) {
+		std::cout << "early exited :)\n";
+		return 0;
+	}
+
     return 0;
 }
